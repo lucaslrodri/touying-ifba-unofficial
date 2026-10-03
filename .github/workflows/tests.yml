@@ -1,0 +1,137 @@
+name: Tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  # release.yml runs this workflow as a gate before publishing
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  tytanic:
+    # Tytanic bundles its own compiler: 0.4.x is Typst 0.15.x, the version the reference images were rendered with.
+    name: Tytanic 0.4.1 (Typst 0.15)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache fonts
+        uses: actions/cache@v6
+        with:
+          path: fonts
+          key: fonts-opensans-newcm-1
+
+      # The suite needs Open Sans, which Typst does not bundle. No system fonts: only fonts/ and the
+      # ones embedded in Tytanic, so the result does not depend on the runner image.
+      - name: Download fonts
+        run: sh scripts/fonts.sh
+
+      # The decks and the tests import `@preview/touying-ifba-unofficial:<version>`: point it to this checkout.
+      - name: Link the package
+        run: sh scripts/link.sh
+
+      - name: Setup Tytanic
+        uses: typst-community/setup-tytanic@v1
+        with:
+          tytanic-version: 0.4.1
+
+      - name: Run test suite
+        run: tt run --font-path fonts --no-fail-fast
+
+      # Not under act: its artifact server does not speak the protocol of upload-artifact v6+ (act 0.2.89).
+      - name: Archive test results
+        uses: actions/upload-artifact@v7
+        if: ${{ failure() && !env.ACT }}
+        with:
+          name: tytanic-results
+          path: |
+            tests/**/diff/*.png
+            tests/**/out/*.png
+            tests/**/ref/*.png
+          retention-days: 5
+
+  minimum-compiler:
+    # `compiler` in typst.toml promises that the package works from that Typst version on: compile the two decks with it.
+    name: Decks on the minimum Typst version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Cache fonts
+        uses: actions/cache@v6
+        with:
+          path: fonts
+          key: fonts-opensans-newcm-1
+
+      - name: Download fonts
+        run: sh scripts/fonts.sh
+
+      - name: Link the package
+        run: sh scripts/link.sh
+
+      - name: Read the minimum version
+        id: manifest
+        run: echo "compiler=$(sed -n 's/^compiler *= *"\(.*\)"/\1/p' typst.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Typst
+        uses: typst-community/setup-typst@v5
+        with:
+          typst-version: ${{ steps.manifest.outputs.compiler }}
+
+      - name: Compile the template and the example
+        run: |
+          typst --version
+          typst compile --font-path fonts --ignore-system-fonts template/main.typ /tmp/template.pdf
+          typst compile --font-path fonts --ignore-system-fonts example/main.typ /tmp/example.pdf
+
+  install:
+    # scripts/install.sh and scripts/install.ps1: install the package into the `local` namespace as a user does, then
+    # create a deck from the template and compile it untouched, with the font the installer puts in the user's folder.
+    name: Installer on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Typst
+        uses: typst-community/setup-typst@v5
+        with:
+          typst-version: 0.15
+
+      - name: Install (macOS and Linux)
+        if: runner.os != 'Windows'
+        run: sh scripts/install.sh --fonts
+
+      - name: Install (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install.ps1 -Fonts
+
+      - name: Create a deck from the installed template and compile it
+        shell: bash
+        run: |
+          version=$(sed -n 's/^version *= *"\(.*\)"/\1/p' typst.toml)
+          typst fonts | grep -x "Open Sans"
+          cd "$RUNNER_TEMP"
+          typst init "@local/touying-ifba-unofficial:$version" deck
+          grep -q "@local/touying-ifba-unofficial:$version" deck/main.typ
+          typst compile deck/main.typ deck/main.pdf
+
+      - name: Uninstall
+        if: runner.os != 'Windows'
+        run: sh scripts/install.sh --uninstall
+
+      - name: Uninstall (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/install.ps1 -Uninstall
